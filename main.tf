@@ -9,16 +9,19 @@ resource "aws_vpc" "main" {
 resource "aws_subnet" "main" {
   vpc_id            = aws_vpc.main.id
   cidr_block        = "10.0.1.0/24"
+  map_public_ip_on_launch = true
 }
 
 resource "aws_subnet" "secondary" {
   vpc_id            = aws_vpc.main.id
   cidr_block        = "10.0.2.0/24"
+  availability_zone = "us-east-2a"
 }
 
 resource "aws_subnet" "tertiary" {
   vpc_id            = aws_vpc.main.id
   cidr_block        = "10.0.3.0/24"
+  availability_zone = "us-east-2b"
 }
 
 # Internet Gateway
@@ -62,11 +65,31 @@ resource "aws_route_table_association" "private2" {
 resource "aws_security_group" "main" {
   name        = "web-sg"
   description = "Security group pour web servers"
-  vpc_id      = "rien ici pour l'instant"
+  vpc_id      = aws_vpc.main.id
 
   ingress {
-    from_port   = 80
-    to_port     = 80
+    from_port   = 3306
+    to_port     = 3306
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+resource "aws_security_group" "main1" {
+  name        = "web-sg1"
+  description = "Security group pour web servers"
+  vpc_id      = aws_vpc.main.id
+
+  ingress {
+    from_port   = 22
+    to_port     = 22
     protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
   }
@@ -101,7 +124,7 @@ resource "aws_security_group" "ec2-rds-1" {
 
 resource "aws_security_group" "db_sg_ext" {
   name        = "db-sg-ext"
-  description = "Security group pour RDS accessible depuis l'extérieur"
+  description = "Security group pour RDS accessible depuis exterieur"
   vpc_id      = aws_vpc.main.id
 
   ingress {
@@ -139,10 +162,6 @@ resource "aws_security_group" "rds-ec2-1" {
   }
 }
 
-output "db_host" {
-  value = aws_rds_instance.db.endpoint
-}
-
 # -------------------------------------DB subnet group--------------------------------------
 resource "aws_db_subnet_group" "main" {
   name       = "main"
@@ -162,9 +181,15 @@ resource "aws_db_instance" "db" {
   db_subnet_group_name = aws_db_subnet_group.main.name
   vpc_security_group_ids = [aws_security_group.rds-ec2-1.id, aws_security_group.db_sg_ext.id]
 
+  skip_final_snapshot  = true
+  
   tags = {
     Name = "MyDBInstance"
   }
+}
+
+output "db_host" {
+  value = aws_db_instance.db.endpoint
 }
 
 # -------------------------------------Instance EC2--------------------------------------
@@ -172,7 +197,7 @@ resource "aws_instance" "web" {
   ami           = "ami-06e3c045d79fd65d9" # Ubuntu server 24.04 LTS
   instance_type = "t2.micro"
   subnet_id     = aws_subnet.main.id
-  security_groups = [aws_security_group.main.name]
+  vpc_security_group_ids = [aws_security_group.main.id, aws_security_group.main1.id]
 
   user_data =   <<-EOF
                 #!/usr/bin/env bash
@@ -180,11 +205,11 @@ resource "aws_instance" "web" {
 
                 APP_DIR="/home/ubuntu/app"
                 SERVICE_NAME="flaskapp"
-                DB_HOST="${aws_db_instance.db.endpoint}"
-                DB_NAME="${aws_db_instance.db.name}"
-                DB_USER="admin"
-                DB_PASSWORD="password1234"
-                APP_PORT="80"
+                DB_HOST="${aws_db_instance.db.address}"
+                DB_NAME="${aws_db_instance.db.db_name}"
+                DB_USER="${aws_db_instance.db.username}"
+                DB_PASSWORD="${aws_db_instance.db.password}"
+                APP_PORT="${aws_db_instance.db.port}"
 
                 export DEBIAN_FRONTEND=noninteractive
 
@@ -195,24 +220,24 @@ resource "aws_instance" "web" {
                 sudo chown -R ubuntu:ubuntu "$APP_DIR"
 
                 cat > "$APP_DIR/data.sql" <<EOF2
-                CREATE DATABASE IF NOT EXISTS ${DB_NAME};
+                CREATE DATABASE IF NOT EXISTS $${DB_NAME};
 
-                USE ${DB_NAME};
+                USE $${DB_NAME};
 
                 CREATE TABLE IF NOT EXISTS messages (
-                id INT AUTO_INCREMENT PRIMARY KEY,
-                message VARCHAR(255) NOT NULL
+                  id INT AUTO_INCREMENT PRIMARY KEY,
+                  message VARCHAR(255) NOT NULL
                 );
 
                 INSERT INTO messages (message)
                 SELECT 'Bonjour depuis AWS'
                 WHERE NOT EXISTS (
-                SELECT 1 FROM messages WHERE message = 'Bonjour depuis AWS'
+                  SELECT 1 FROM messages WHERE message = 'Bonjour depuis AWS'
                 );
                 EOF2
                 echo "Attente MySQL..."
                 until mysqladmin ping -h "$DB_HOST" -u "$DB_USER" -p"$DB_PASSWORD" --silent; do
-                sleep 5
+                  sleep 5
                 done
 
                 echo "Import SQL..."
@@ -280,23 +305,23 @@ resource "aws_instance" "web" {
                 deactivate
 
                 cat > "$APP_DIR/.env" <<ENVEOF
-                DB_HOST=${DB_HOST}
-                DB_NAME=${DB_NAME}
-                DB_USER=${DB_USER}
-                DB_PASSWORD=${DB_PASSWORD}
-                APP_PORT=${APP_PORT}
+                DB_HOST=$${DB_HOST}
+                DB_NAME=$${DB_NAME}
+                DB_USER=$${DB_USER}
+                DB_PASSWORD=$${DB_PASSWORD}
+                APP_PORT=$${APP_PORT}
                 ENVEOF
 
-                sudo tee /etc/systemd/system/${SERVICE_NAME}.service >/dev/null <<SERVICEEOF
+                sudo tee /etc/systemd/system/$${SERVICE_NAME}.service >/dev/null <<SERVICEEOF
                 [Unit]
                 Description=Application Flask Guestbook
                 After=network.target
 
                 [Service]
                 User=ubuntu
-                WorkingDirectory=${APP_DIR}
-                EnvironmentFile=${APP_DIR}/.env
-                ExecStart=${APP_DIR}/venv/bin/python ${APP_DIR}/app.py
+                WorkingDirectory=$${APP_DIR}
+                EnvironmentFile=$${APP_DIR}/.env
+                ExecStart=$${APP_DIR}/venv/bin/python $${APP_DIR}/app.py
                 Restart=always
 
                 [Install]
@@ -304,11 +329,11 @@ resource "aws_instance" "web" {
                 SERVICEEOF
 
                 sudo systemctl daemon-reload
-                sudo systemctl enable ${SERVICE_NAME}
-                sudo systemctl restart ${SERVICE_NAME}
-                sudo systemctl status ${SERVICE_NAME} --no-pager || true
+                sudo systemctl enable $${SERVICE_NAME}
+                sudo systemctl restart $${SERVICE_NAME}
+                sudo systemctl status $${SERVICE_NAME} --no-pager || true
 
-                echo "Installation Flask terminée. Application disponible sur le port ${APP_PORT}."
+                echo "Installation Flask terminée. Application disponible sur le port $${APP_PORT}."
                 EOF
 
   tags = {
@@ -317,10 +342,10 @@ resource "aws_instance" "web" {
 }
 
 output "public_ip" {
-  value = aws_instance.web_server.public_ip
+  value = aws_instance.web.public_ip
 }
 
 output "endpoint" {
-  value = "http://${aws_instance.web.public_ip}:${APP_PORT}"    
+  value = "http://${aws_instance.web.public_ip}:80"    
   
 }
